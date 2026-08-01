@@ -9,19 +9,18 @@ from bs4 import BeautifulSoup
 from fpdf import FPDF
 from PIL import Image
 
-app = FastAPI(title="VIN Checker API Pro", version="2.2.0")
+app = FastAPI(title="VIN Checker API Pro", version="2.3.0")
 
 USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/120.0.0.0 Safari/537.36"
 
-GLOSSARY = {
-    "Primary Damage": "Основная зона повреждений (удар спереди, сбоку, переворот и т.д.).",
-    "Salvage Title": "Автомобиль признан страховой компанией непригодным к восстановлению (тоталь).",
-    "Rebuilt Title": "Автомобиль после сильного ДТП был официально отремонтирован и прошёл техосмотр.",
-    "Odometer Rollback": "Несоответствие пробега (подозрение или факт скрутки).",
-    "Clean Title": "Юридически чистый документ без отметки страхового тоталя."
+GLOSSARY_EN = {
+    "Primary Damage": "Main crash area (Front End, Rear End, Rollover, etc.).",
+    "Salvage Title": "Total loss status assigned by insurance company.",
+    "Rebuilt Title": "Vehicle was salvaged, rebuilt and passed technical inspection.",
+    "Odometer Rollback": "Inconsistency detected in mileage records.",
+    "Clean Title": "No insurance total loss history recorded."
 }
 
-# Переводчик повреждений с английского
 DAMAGE_TRANSLATIONS = {
     "FRONT END": "Удар спереди (Front End)",
     "REAR END": "Удар сзади (Rear End)",
@@ -48,15 +47,15 @@ async def decode_vin_basic(client: httpx.AsyncClient, vin: str) -> Dict[str, Any
         if response.status_code == 200:
             res = response.json().get("Results", [{}])[0]
             return {
-                "make": res.get("Make") or "Н/Д",
-                "model": res.get("Model") or "Н/Д",
-                "year": res.get("ModelYear") or "Н/Д",
-                "body_class": res.get("BodyClass") or "Н/Д",
-                "drive_type": res.get("DriveType") or "Н/Д",
-                "engine_hp": res.get("EngineHP") or "Н/Д",
-                "displacement_l": res.get("DisplacementL") or "Н/Д",
-                "fuel_type": res.get("FuelTypePrimary") or "Н/Д",
-                "plant_country": res.get("PlantCountry") or "Н/Д"
+                "make": res.get("Make") or "N/A",
+                "model": res.get("Model") or "N/A",
+                "year": res.get("ModelYear") or "N/A",
+                "body_class": res.get("BodyClass") or "N/A",
+                "drive_type": res.get("DriveType") or "N/A",
+                "engine_hp": res.get("EngineHP") or "N/A",
+                "displacement_l": res.get("DisplacementL") or "N/A",
+                "fuel_type": res.get("FuelTypePrimary") or "N/A",
+                "plant_country": res.get("PlantCountry") or "N/A"
             }
     except Exception:
         pass
@@ -66,9 +65,9 @@ async def check_deep_auction_data(client: httpx.AsyncClient, vin: str) -> Dict[s
     url = f"https://bid.cars/en/search/vin/{vin}"
     auction_info = {
         "found": False,
-        "lot_number": "Н/Д",
-        "primary_damage": "No severe damage reported",
-        "odometer_at_sale": "Не указан",
+        "lot_number": "N/A",
+        "primary_damage": "NO SEVERE DAMAGE REPORTED",
+        "odometer_at_sale": "N/A",
         "photo_url": None,
         "photo_bytes": None
     }
@@ -92,7 +91,6 @@ async def check_deep_auction_data(client: httpx.AsyncClient, vin: str) -> Dict[s
                     try:
                         img_res = await client.get(auction_info["photo_url"], timeout=4.0)
                         if img_res.status_code == 200:
-                            # Проверяем валидность картинки через Pillow
                             img_io = io.BytesIO(img_res.content)
                             with Image.open(img_io) as img:
                                 img.verify()
@@ -177,7 +175,6 @@ def generate_pdf_report(data: dict) -> io.BytesIO:
     
     start_y = pdf.get_y()
     
-    # Картинка с безопасным перехватом ошибок
     has_img = False
     if auction.get("photo_bytes"):
         try:
@@ -195,14 +192,13 @@ def generate_pdf_report(data: dict) -> io.BytesIO:
         pdf.set_text_color(148, 163, 184)
         pdf.cell(50, 5, "No Image Available")
 
-    # Текст отчета
     pdf.set_xy(75, start_y)
     pdf.set_font("Helvetica", "B", 8)
     pdf.set_text_color(100, 116, 139)
     pdf.cell(32, 5, "Primary Damage:")
     pdf.set_font("Helvetica", "B", 8)
     pdf.set_text_color(220, 38, 38)
-    pdf.cell(0, 5, str(auction.get("damage_ru")), new_x="LMARGIN", new_y="NEXT")
+    pdf.cell(0, 5, str(auction.get("primary_damage", "N/A")), new_x="LMARGIN", new_y="NEXT")
     
     pdf.set_x(75)
     pdf.set_font("Helvetica", "B", 8)
@@ -210,7 +206,7 @@ def generate_pdf_report(data: dict) -> io.BytesIO:
     pdf.cell(32, 5, "Odometer at Sale:")
     pdf.set_font("Helvetica", "", 8)
     pdf.set_text_color(15, 23, 42)
-    pdf.cell(0, 5, str(auction.get("odometer_at_sale")), new_x="LMARGIN", new_y="NEXT")
+    pdf.cell(0, 5, str(auction.get("odometer_at_sale", "N/A")), new_x="LMARGIN", new_y="NEXT")
 
     pdf.set_x(75)
     pdf.set_font("Helvetica", "B", 8)
@@ -274,7 +270,7 @@ def generate_pdf_report(data: dict) -> io.BytesIO:
     pdf.line(10, pdf.get_y(), 200, pdf.get_y())
     pdf.ln(3)
 
-    for term, definition in GLOSSARY.items():
+    for term, definition in GLOSSARY_EN.items():
         pdf.set_font("Helvetica", "B", 8)
         pdf.set_text_color(37, 99, 235)
         pdf.cell(40, 4, f"{term}:")
@@ -336,7 +332,6 @@ async def get_vin_history_pdf(vin: str = Path(..., min_length=17, max_length=17)
         return StreamingResponse(pdf_stream, media_type="application/pdf", headers=headers)
     except Exception as e:
         print(f"PDF Generation error: {e}")
-        # Возвращаем понятную ошибку вместо 500
         return {"error": "Failed to generate PDF"}
 
 if __name__ == "__main__":
