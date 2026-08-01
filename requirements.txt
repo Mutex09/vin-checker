@@ -1,0 +1,6 @@
+Plaintext
+
+fastapi
+uvicorn
+httpx
+beautifulsoup4
