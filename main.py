@@ -1,9 +1,12 @@
 import asyncio
 import re
+import io
 from typing import Dict, Any, List
-from fastapi import FastAPI, HTTPException, Query, Path
+from fastapi import FastAPI, HTTPException, Path
+from fastapi.responses import StreamingResponse
 import httpx
 from bs4 import BeautifulSoup
+from fpdf import FPDF
 
 app = FastAPI(
     title="Free VIN History Aggregator API",
@@ -18,7 +21,6 @@ USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTM
 # ==========================================
 
 async def decode_vin_basic(client: httpx.AsyncClient, vin: str) -> Dict[str, Any]:
-    """Декодирование базовых характеристик через публичный API NHTSA"""
     url = f"https://vpic.nhtsa.dot.gov/api/vehicles/decodevinvalues/{vin}?format=json"
     try:
         response = await client.get(url, timeout=5.0)
@@ -36,7 +38,6 @@ async def decode_vin_basic(client: httpx.AsyncClient, vin: str) -> Dict[str, Any
     return {}
 
 async def check_auction_history(client: httpx.AsyncClient, vin: str) -> List[Dict[str, Any]]:
-    """Поиск истории в открытых архивах США/Европы (BidCars)"""
     url = f"https://bid.cars/en/search/vin/{vin}"
     records = []
     try:
@@ -62,7 +63,6 @@ async def check_auction_history(client: httpx.AsyncClient, vin: str) -> List[Dic
     return records
 
 async def search_public_footprint(client: httpx.AsyncClient, vin: str) -> List[Dict[str, str]]:
-    """Поиск упоминаний VIN в открытом индексе DuckDuckGo"""
     url = f"https://html.duckduckgo.com/html/?q=\"{vin}\""
     results = []
     try:
@@ -90,7 +90,56 @@ async def search_public_footprint(client: httpx.AsyncClient, vin: str) -> List[D
     return results
 
 # ==========================================
-# AGGREGATION CORE
+# PDF GENERATOR
+# ==========================================
+
+def generate_pdf_report(data: dict) -> io.BytesIO:
+    pdf = FPDF()
+    pdf.add_page()
+    pdf.set_font("Helvetica", "B", 16)
+    
+    # Заголовок
+    pdf.cell(0, 10, f"VIN Vehicle History Report", new_x="LMARGIN", new_y="NEXT", align="C")
+    pdf.set_font("Helvetica", "", 12)
+    pdf.cell(0, 10, f"VIN Code: {data['vin']}", new_x="LMARGIN", new_y="NEXT", align="C")
+    pdf.ln(5)
+    
+    # Спецификация
+    pdf.set_font("Helvetica", "B", 14)
+    pdf.cell(0, 8, "Vehicle Specifications", new_x="LMARGIN", new_y="NEXT")
+    pdf.set_font("Helvetica", "", 11)
+    
+    specs = data.get("vehicle_specs", {})
+    pdf.cell(0, 6, f"Make: {specs.get('make', 'N/A')}", new_x="LMARGIN", new_y="NEXT")
+    pdf.cell(0, 6, f"Model: {specs.get('model', 'N/A')}", new_x="LMARGIN", new_y="NEXT")
+    pdf.cell(0, 6, f"Year: {specs.get('year', 'N/A')}", new_x="LMARGIN", new_y="NEXT")
+    pdf.cell(0, 6, f"Engine: {specs.get('engine', 'N/A')}", new_x="LMARGIN", new_y="NEXT")
+    pdf.ln(5)
+    
+    # История пробегов
+    pdf.set_font("Helvetica", "B", 14)
+    pdf.cell(0, 8, "Mileage Records", new_x="LMARGIN", new_y="NEXT")
+    pdf.set_font("Helvetica", "", 11)
+    
+    timeline = data.get("history", {}).get("mileage_timeline", [])
+    if timeline:
+        for record in timeline:
+            pdf.cell(0, 6, f"- {record['source']}: {record['value']}", new_x="LMARGIN", new_y="NEXT")
+    else:
+        pdf.cell(0, 6, "No mileage records found in open sources.", new_x="LMARGIN", new_y="NEXT")
+        
+    pdf.ln(10)
+    pdf.set_font("Helvetica", "I", 9)
+    pdf.cell(0, 5, "Generated automatically by Free VIN History Aggregator API", new_x="LMARGIN", new_y="NEXT", align="C")
+    
+    # Возвращаем файл в виде потока байт
+    pdf_output = io.BytesIO()
+    pdf_output.write(pdf.output())
+    pdf_output.seek(0)
+    return pdf_output
+
+# ==========================================
+# ENDPOINTS
 # ==========================================
 
 @app.get("/api/v1/vin/{vin}")
@@ -100,16 +149,13 @@ async def get_vin_history(
     vin = vin.upper()
     
     async with httpx.AsyncClient(follow_redirects=True) as client:
-        specs_task = decode_vin_basic(client, vin)
-        auction_task = check_auction_history(client, vin)
-        footprint_task = search_public_footprint(client, vin)
-        
         specs, auctions, footprint = await asyncio.gather(
-            specs_task, auction_task, footprint_task
+            decode_vin_basic(client, vin),
+            check_auction_history(client, vin),
+            search_public_footprint(client, vin)
         )
         
     mileage_timeline = []
-    
     for item in auctions:
         if item.get("odometer") and item["odometer"] != "Unknown":
             mileage_timeline.append({"source": item["source"], "value": item["odometer"]})
@@ -132,6 +178,19 @@ async def get_vin_history(
             "is_free_report": True
         }
     }
+
+@app.get("/api/v1/vin/{vin}/pdf")
+async def get_vin_history_pdf(
+    vin: str = Path(..., min_length=17, max_length=17, description="17-значный VIN-код")
+):
+    """Генерация и скачивание PDF-отчета"""
+    data = await get_vin_history(vin)
+    pdf_stream = generate_pdf_report(data)
+    
+    headers = {
+        "Content-Disposition": f"attachment; filename=VIN_Report_{vin}.pdf"
+    }
+    return StreamingResponse(pdf_stream, media_type="application/pdf", headers=headers)
 
 if __name__ == "__main__":
     import uvicorn
