@@ -1,7 +1,7 @@
 import asyncio
 import re
 from typing import Dict, Any, List
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException, Query, Path
 import httpx
 from bs4 import BeautifulSoup
 
@@ -95,7 +95,7 @@ async def search_public_footprint(client: httpx.AsyncClient, vin: str) -> List[D
 
 @app.get("/api/v1/vin/{vin}")
 async def get_vin_history(
-    vin: str = Query(..., min_length=17, max_length=17, description="17-значный VIN-код")
+    vin: str = Path(..., min_length=17, max_length=17, description="17-значный VIN-код")
 ):
     vin = vin.upper()
     
