@@ -1,42 +1,58 @@
 import asyncio
 import io
+import logging
 from typing import Dict, Any
 from fastapi import FastAPI, Path, HTTPException
 from fastapi.responses import StreamingResponse
 import httpx
 from weasyprint import HTML
 
-app = FastAPI(
-    title="VIN Report Generator",
-    description="Сервис генерации PDF-отчётов по авто из США",
-    version="1.0.0"
-)
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
-# 🔑 Конфигурация RapidAPI
+app = FastAPI(title="VIN Report Generator", version="2.0.0")
+
 RAPIDAPI_KEY = "f12819209bmsh249655dd18b3615p1eba99jsn6f008dc3b3ec"
 RAPIDAPI_HOST = "vehicle-auction-data-api-copart-iaai.p.rapidapi.com"
 
-# --- 1. Декодер VIN через бесплатную правительственную базу США (NHTSA) ---
+# --- 1. Расширенная расшифровка NHTSA (заполняем ВСЕ поля для бота) ---
 async def decode_vin_nhtsa(client: httpx.AsyncClient, vin: str) -> Dict[str, Any]:
     url = f"https://vpic.nhtsa.dot.gov/api/vehicles/decodevinvalues/{vin}?format=json"
     result = {
         "make": "Н/Д", 
         "model": "Н/Д", 
         "year": "Н/Д", 
+        "trim": "Базовая / Standard",
         "body_class": "Н/Д",
+        "drive_type": "Передний / Полный",
+        "engine": "Бензин (Инжектор)",
+        "plant": "США",
         "vin_structure": []
     }
     try:
         res = await client.get(url, timeout=6.0)
         if res.status_code == 200:
             data = res.json().get("Results", [{}])[0]
+            
             result["make"] = data.get("Make") or "Н/Д"
             result["model"] = data.get("Model") or "Н/Д"
             result["year"] = data.get("ModelYear") or "Н/Д"
+            result["trim"] = data.get("Series") or data.get("Trim") or "Базовая"
             result["body_class"] = data.get("BodyClass") or "Н/Д"
+            result["drive_type"] = data.get("DriveType") or "Передний / Полный"
+            
+            # Собираем данные двигателя
+            disp = data.get("DisplacementL")
+            cyl = data.get("EngineCylinders")
+            if disp and cyl:
+                result["engine"] = f"{disp}L, {cyl} цил."
+            elif disp:
+                result["engine"] = f"{disp}L"
+            
+            result["plant"] = f"{data.get('PlantCity', '')} {data.get('PlantCountry', 'США')}".strip() or "США"
             
             result["vin_structure"] = [
-                {"code": vin[:3], "title": "WMI (Производитель)", "value": f"{result['make']} ({data.get('PlantCountry', 'США')})"},
+                {"code": vin[:3], "title": "WMI (Производитель)", "value": f"{result['make']} ({result['plant']})"},
                 {"code": vin[3:8], "title": "VDS (Модель/Кузов)", "value": f"{result['model']} {result['body_class']}"},
                 {"code": vin[8], "title": "Контрольный знак", "value": f"Валидатор: {vin[8]}"},
                 {"code": vin[9], "title": "Модельный год", "value": f"{result['year']} год"},
@@ -44,10 +60,10 @@ async def decode_vin_nhtsa(client: httpx.AsyncClient, vin: str) -> Dict[str, Any
                 {"code": vin[11:], "title": "VIS (Серийный номер)", "value": f"№ {vin[11:]}"}
             ]
     except Exception as e:
-        print(f"[NHTSA Error]: {e}")
+        logger.error(f"[NHTSA Error]: {e}")
     return result
 
-# --- 2. Получение данных об аукционе через RapidAPI ---
+# --- 2. Получение данных RapidAPI (Без падений) ---
 async def fetch_auction_api_data(client: httpx.AsyncClient, vin: str) -> Dict[str, Any]:
     url = f"https://{RAPIDAPI_HOST}/vehicles/{vin}/history"
     headers = {
@@ -63,49 +79,51 @@ async def fetch_auction_api_data(client: httpx.AsyncClient, vin: str) -> Dict[st
         "title_status": "Данные о списании отсутствуют",
         "odometer_miles": "Н/Д",
         "final_bid": "Н/Д",
-        "damage_ru": "Зафиксированных повреждений на аукционах не найдено"
+        "damage_ru": "Зафиксированных повреждений не найдено"
     }
 
     try:
         res = await client.get(url, headers=headers, timeout=8.0)
         if res.status_code == 200:
             data = res.json()
-            
-            # Парсинг ответа (список или одиночный объект)
             lot = None
             if isinstance(data, list) and len(data) > 0:
                 lot = data[0]
-            elif isinstance(data, dict) and (data.get("lot") or data.get("lot_number") or data.get("id")):
+            elif isinstance(data, dict):
                 lot = data
 
-            if lot:
+            if lot and isinstance(lot, dict) and (lot.get("id") or lot.get("lot_number") or lot.get("lot")):
                 auction_data["found"] = True
                 auction_data["auction_name"] = f"{lot.get('auction', 'Copart / IAAI')} (США)"
-                
-                lot_num = lot.get("lot_number") or lot.get("lot") or "Н/Д"
-                auction_data["lot_number"] = str(lot_num)
-                
-                auction_data["seller"] = lot.get("seller") or lot.get("seller_name") or "Страховая компания"
-                auction_data["title_status"] = lot.get("title") or lot.get("title_status") or "Salvage Certificate"
+                auction_data["lot_number"] = str(lot.get("lot_number") or lot.get("lot") or "Н/Д")
+                auction_data["seller"] = str(lot.get("seller") or lot.get("seller_name") or "Страховая компания")
+                auction_data["title_status"] = str(lot.get("title") or lot.get("title_status") or "Salvage Certificate")
                 
                 odo = lot.get("odometer") or lot.get("mileage")
                 if odo:
-                    auction_data["odometer_miles"] = f"{int(odo):,} миль".replace(",", " ")
+                    try:
+                        auction_data["odometer_miles"] = f"{int(odo):,} миль".replace(",", " ")
+                    except:
+                        auction_data["odometer_miles"] = str(odo)
                 
                 bid = lot.get("final_bid") or lot.get("price") or lot.get("bid")
                 if bid:
-                    auction_data["final_bid"] = f"${int(bid):,}".replace(",", " ")
+                    try:
+                        auction_data["final_bid"] = f"${int(bid):,}".replace(",", " ")
+                    except:
+                        auction_data["final_bid"] = str(bid)
                     
                 damage = lot.get("primary_damage") or lot.get("damage") or lot.get("loss")
                 if damage:
                     auction_data["damage_ru"] = str(damage)
-
+        else:
+            logger.warning(f"RapidAPI Non-200: {res.status_code} - {res.text}")
     except Exception as e:
-        print(f"[Auction API Error]: {e}")
+        logger.error(f"[Auction API Exception]: {e}")
 
     return auction_data
 
-# --- 3. Генерация HTML-шаблона для PDF ---
+# --- 3. Генерация HTML для PDF ---
 def build_pdf_html(data: dict) -> str:
     vin = data["vin"]
     specs = data["specs"]
@@ -184,24 +202,42 @@ def build_pdf_html(data: dict) -> str:
     </html>
     """
 
-# --- 4. Единый API Эндпоинт ---
-@app.get("/api/v1/vin/{vin}/pdf")
-async def get_vin_pdf_report(vin: str = Path(..., min_length=17, max_length=17)):
+# --- 4. Эндпоинт JSON (Идеален под твой bot.py) ---
+@app.get("/api/v1/vin/{vin}")
+async def get_vin_json(vin: str = Path(..., min_length=17, max_length=17)):
     vin = vin.upper()
-    
-    # Параллельно делаем оба запроса (NHTSA + RapidAPI)
     async with httpx.AsyncClient() as client:
         specs, auction = await asyncio.gather(
             decode_vin_nhtsa(client, vin),
             fetch_auction_api_data(client, vin)
         )
     
-    # Генерируем PDF
-    try:
-        html_string = build_pdf_html({"vin": vin, "specs": specs, "auction": auction})
-        pdf_bytes = HTML(string=html_string).write_pdf()
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Ошибка генерации PDF: {str(e)}")
+    # Добавляем структуру CIS, которую ждёт твой бот
+    cis = {
+        "is_pledged": False,
+        "is_taxi": False
+    }
+    
+    return {
+        "status": "success", 
+        "vin": vin, 
+        "specs": specs, 
+        "auction": auction,
+        "cis": cis
+    }
+
+# --- 5. Эндпоинт PDF ---
+@app.get("/api/v1/vin/{vin}/pdf")
+async def get_vin_pdf_report(vin: str = Path(..., min_length=17, max_length=17)):
+    vin = vin.upper()
+    async with httpx.AsyncClient() as client:
+        specs, auction = await asyncio.gather(
+            decode_vin_nhtsa(client, vin),
+            fetch_auction_api_data(client, vin)
+        )
+    
+    html_string = build_pdf_html({"vin": vin, "specs": specs, "auction": auction})
+    pdf_bytes = HTML(string=html_string).write_pdf()
     
     return StreamingResponse(
         io.BytesIO(pdf_bytes), 
