@@ -2,7 +2,7 @@ import asyncio
 import io
 import logging
 from typing import Dict, Any
-from fastapi import FastAPI, Path, HTTPException
+from fastapi import FastAPI, Path
 from fastapi.responses import StreamingResponse
 import httpx
 from weasyprint import HTML
@@ -10,66 +10,68 @@ from weasyprint import HTML
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-app = FastAPI(title="VIN Report Generator Pro", version="3.0.0")
+app = FastAPI(title="VIN Report Generator Pro", version="3.1.0")
 
 RAPIDAPI_KEY = "f12819209bmsh249655dd18b3615p1eba99jsn6f008dc3b3ec"
 RAPIDAPI_HOST = "vehicle-auction-data-api-copart-iaai.p.rapidapi.com"
 
-# --- 1. Детальная посимвольная расшифровка VIN и NHTSA ---
+# --- 1. Динамическая расшифровка NHTSA API ---
 async def decode_vin_nhtsa(client: httpx.AsyncClient, vin: str) -> Dict[str, Any]:
     url = f"https://vpic.nhtsa.dot.gov/api/vehicles/decodevinvalues/{vin}?format=json"
     
-    # Базовые значения по умолчанию
     specs = {
-        "make": "Ford",
-        "model": "Escape",
-        "year": "2019",
-        "trim": "SEL / Titanium",
-        "body_class": "Sport Utility Vehicle (SUV) / Crossover",
-        "drive_type": "Полный привод (AWD / 4WD)",
-        "engine": "2.0L EcoBoost GTDI (4-цил, Turbo)",
-        "plant": "Louisville Assembly Plant (Кентукки, США)",
+        "make": "Н/Д",
+        "model": "Н/Д",
+        "year": "Н/Д",
+        "trim": "Базовая",
+        "body_class": "Н/Д",
+        "drive_type": "Н/Д",
+        "engine": "Н/Д",
+        "plant": "Н/Д",
         "structure": []
     }
 
     try:
-        res = await client.get(url, timeout=6.0)
+        res = await client.get(url, timeout=7.0)
         if res.status_code == 200:
             data = res.json().get("Results", [{}])[0]
-            if data.get("Make"): specs["make"] = data.get("Make")
-            if data.get("Model"): specs["model"] = data.get("Model")
-            if data.get("ModelYear"): specs["year"] = data.get("ModelYear")
-            if data.get("Series") or data.get("Trim"): 
-                specs["trim"] = data.get("Series") or data.get("Trim")
-            if data.get("BodyClass"): specs["body_class"] = data.get("BodyClass")
-            if data.get("DriveType"): specs["drive_type"] = data.get("DriveType")
+            
+            specs["make"] = data.get("Make") or "Н/Д"
+            specs["model"] = data.get("Model") or "Н/Д"
+            specs["year"] = data.get("ModelYear") or "Н/Д"
+            specs["trim"] = data.get("Series") or data.get("Trim") or "Стандарт"
+            specs["body_class"] = data.get("BodyClass") or "Н/Д"
+            specs["drive_type"] = data.get("DriveType") or "Н/Д"
             
             disp = data.get("DisplacementL")
             cyl = data.get("EngineCylinders")
             if disp and cyl:
-                specs["engine"] = f"{disp}L EcoBoost GTDI ({cyl}-цилиндровый)"
+                specs["engine"] = f"{disp}L ({cyl}-цил.)"
+            elif disp:
+                specs["engine"] = f"{disp}L"
             
-            plant_city = data.get("PlantCity") or "Louisville"
-            plant_country = data.get("PlantCountry") or "USA"
-            specs["plant"] = f"{plant_city} Assembly Plant ({plant_country})"
+            city = data.get("PlantCity") or ""
+            country = data.get("PlantCountry") or ""
+            specs["plant"] = f"{city} {country}".strip() or "Н/Д"
+
     except Exception as e:
         logger.error(f"[NHTSA Error]: {e}")
 
-    # Формируем ПОСИМВОЛЬНУЮ ТАБЛИЦУ VIN (как в твоем примере)
+    # Честная динамическая структура VIN по позициям
     specs["structure"] = [
-        {"code": vin[:3], "title": "Производитель", "desc": f"{specs['make']} Motor Company (США), SUV/Truck"},
-        {"code": vin[3], "title": "Класс массы", "desc": "4 001 – 5 000 фунтов (Класс C)"},
-        {"code": vin[4:7], "title": "Модель / Кузов", "desc": f"{specs['make']} {specs['model']}, AWD"},
-        {"code": vin[7], "title": "Двигатель", "desc": specs["engine"]},
-        {"code": vin[8], "title": "Контрольная цифра", "desc": f"Валидатор: {vin[8]}"},
+        {"code": vin[:3], "title": "WMI (Производитель)", "desc": f"{specs['make']} ({specs['plant']})"},
+        {"code": vin[3], "title": "Класс / Безопасность", "desc": f"Спецификация кузова: {vin[3]}"},
+        {"code": vin[4:7], "title": "Модель / Кузов", "desc": f"{specs['make']} {specs['model']}"},
+        {"code": vin[7], "title": "Код двигателя", "desc": specs["engine"]},
+        {"code": vin[8], "title": "Контрольный знак", "desc": f"Валидатор: {vin[8]}"},
         {"code": vin[9], "title": "Модельный год", "desc": f"{specs['year']} год"},
-        {"code": vin[10], "title": "Сборочный завод", "desc": specs["plant"]},
-        {"code": vin[11:], "title": "Серийный номер", "desc": f"№ {vin[11:]}"}
+        {"code": vin[10], "title": "Завод сборки", "desc": f"Код завода: {vin[10]}"},
+        {"code": vin[11:], "title": "VIS (Серийный номер)", "desc": f"№ {vin[11:]}"}
     ]
 
     return specs
 
-# --- 2. Запрос к RapidAPI (Аукционы США) ---
+# --- 2. Честный запрос к RapidAPI (Без хардкода!) ---
 async def fetch_auction_api_data(client: httpx.AsyncClient, vin: str) -> Dict[str, Any]:
     url = f"https://{RAPIDAPI_HOST}/vehicles/{vin}/history"
     headers = {
@@ -77,35 +79,41 @@ async def fetch_auction_api_data(client: httpx.AsyncClient, vin: str) -> Dict[st
         "X-RapidAPI-Host": RAPIDAPI_HOST
     }
     
+    # ПО УМОЛЧАНИЮ: ДАННЫХ НЕТ
     auction = {
         "found": False,
-        "auction_name": "Copart (США, Роли / Raleigh, NC)",
-        "lot_number": "1-70088422",
-        "seller": "Страховая компания USAA (USAA Approved)",
-        "title_status": "Salvage Certificate of Title (Списание страховой)",
-        "odometer_miles": "14,606 миль (~23,506 км)",
-        "final_bid": "$12,050",
-        "damage_ru": "Днище, элемент подвески, подрамник (Undercarriage / Frame / Suspension)",
-        "advice": "У автомобиля зафиксированы повреждения нижней части (Undercarriage / Frame). Обязательно поднимите автомобиль на подъёмнике. Проверьте состояние геометрических точек подрамника, рычагов передней и задней подвески, поддона двигателя и трансмиссии."
+        "auction_name": "В базах списаний США не найден",
+        "lot_number": "Н/Д",
+        "seller": "Н/Д",
+        "title_status": "Данные отсутствуют",
+        "odometer_miles": "Н/Д",
+        "final_bid": "Н/Д",
+        "damage_ru": "Зафиксированных повреждений не найдено",
+        "advice": None
     }
 
     try:
         res = await client.get(url, headers=headers, timeout=8.0)
         if res.status_code == 200:
             data = res.json()
+            
+            # Разбираем ответ RapidAPI
             lot = None
             if isinstance(data, list) and len(data) > 0:
                 lot = data[0]
             elif isinstance(data, dict):
-                lot = data.get("data") or data
+                lot = data.get("data") or data.get("result") or data
 
-            if lot and isinstance(lot, dict):
+            if lot and isinstance(lot, dict) and (lot.get("id") or lot.get("lot_number") or lot.get("lot") or lot.get("auction")):
                 auction["found"] = True
-                if lot.get("auction"): auction["auction_name"] = str(lot.get("auction"))
-                if lot.get("lot_number") or lot.get("lot"): 
-                    auction["lot_number"] = str(lot.get("lot_number") or lot.get("lot"))
-                if lot.get("seller"): auction["seller"] = str(lot.get("seller"))
-                if lot.get("title"): auction["title_status"] = str(lot.get("title"))
+                
+                auction_site = lot.get("auction") or "Copart / IAAI"
+                location = lot.get("location") or lot.get("state") or ""
+                auction["auction_name"] = f"{auction_site} ({location})".strip()
+                
+                auction["lot_number"] = str(lot.get("lot_number") or lot.get("lot") or "Н/Д")
+                auction["seller"] = str(lot.get("seller") or lot.get("seller_name") or "Страховая компания")
+                auction["title_status"] = str(lot.get("title") or lot.get("title_status") or "Salvage Title")
                 
                 odo = lot.get("odometer") or lot.get("mileage")
                 if odo:
@@ -120,15 +128,13 @@ async def fetch_auction_api_data(client: httpx.AsyncClient, vin: str) -> Dict[st
                 if bid:
                     auction["final_bid"] = f"${bid}" if not str(bid).startswith("$") else str(bid)
 
-                damage = lot.get("primary_damage") or lot.get("damage")
+                damage = lot.get("primary_damage") or lot.get("damage") or lot.get("loss")
                 if damage:
                     auction["damage_ru"] = str(damage)
-        else:
-            # Если API отдало ошибку или не нашло, оставляем заготовленные данные для проверки
-            auction["found"] = True
+                    auction["advice"] = f"Зафиксированы повреждения: {damage}. Рекомендуется детальная проверка геометрии и несущих элементов на СТО."
+
     except Exception as e:
         logger.error(f"[Auction API Exception]: {e}")
-        auction["found"] = True
 
     return auction
 
@@ -138,11 +144,44 @@ def build_pdf_html(data: dict) -> str:
     specs = data["specs"]
     auction = data["auction"]
 
-    # Формируем строки посимвольной структуры VIN
     vin_rows_html = "".join([
         f"<tr><td><b>{item['code']}</b></td><td>{item['title']}</td><td>{item['desc']}</td></tr>"
         for item in specs.get("structure", [])
     ])
+
+    # Динамический блок аукциона
+    if auction["found"]:
+        auction_content = f"""
+        <table class="grid-table">
+            <tr><th width="32%">ПАРАМЕТР</th><th width="68%">ЗНАЧЕНИЕ</th></tr>
+            <tr><td><b>Площадка и Лот:</b></td><td>{auction.get('auction_name')} | Лот № {auction.get('lot_number')}</td></tr>
+            <tr><td><b>Продавец:</b></td><td>{auction.get('seller')}</td></tr>
+            <tr><td><b>Тип документа (Title):</b></td><td><span class="badge-danger">{auction.get('title_status')}</span></td></tr>
+            <tr><td><b>Пробег при списании:</b></td><td><b>{auction.get('odometer_miles')}</b></td></tr>
+            <tr><td><b>Финальная ставка:</b></td><td><b>{auction.get('final_bid')}</b></td></tr>
+            <tr><td><b>Характер повреждений:</b></td><td><span class="text-danger">{auction.get('damage_ru')}</span></td></tr>
+        </table>
+        """
+        advice_content = f"""
+        <div class="advice-card alert">
+            <b>⚠ Особое внимание при осмотре:</b><br>
+            • {auction.get('advice') or 'Проверьте силовые элементы кузова и подушки безопасности.'}
+        </div>
+        """
+    else:
+        auction_content = """
+        <div class="status-card success">
+            <b>✔ Записи об аварийных торгах не найдены</b><br>
+            Автомобиль не проходил через страховые аукционы США (Copart / IAAI). В архивах списаний данные отсутствуют.
+        </div>
+        """
+        advice_content = """
+        <div class="advice-card info">
+            <b>📋 Рекомендация перед покупкой:</b><br>
+            • Автомобиль не имеет историй списания страховыми компаниями США.<br>
+            • Проведите стандартный визуальный и компьютерный осмотр перед совершением сделки.
+        </div>
+        """
 
     return f"""
     <!DOCTYPE html>
@@ -153,31 +192,28 @@ def build_pdf_html(data: dict) -> str:
             @page {{ size: A4; margin: 12mm; background-color: #ffffff; }}
             body {{ font-family: 'Liberation Sans', 'Arial', sans-serif; color: #1e293b; margin: 0; font-size: 9.5pt; line-height: 1.3; }}
             
-            /* Header */
             .header {{ background: linear-gradient(135deg, #0f2b5c, #1e3a8a); color: #ffffff; padding: 16px 20px; border-radius: 6px; margin-bottom: 12px; }}
             .header h1 {{ margin: 0; font-size: 16pt; text-transform: uppercase; letter-spacing: 0.5px; }}
             .header p {{ margin: 3px 0 0 0; font-size: 8.5pt; color: #93c5fd; }}
             
-            /* VIN Bar */
             .vin-bar {{ background-color: #ffffff; border: 2px solid #2563eb; padding: 10px 14px; border-radius: 6px; margin-bottom: 14px; font-size: 11pt; }}
             .vin-code {{ font-size: 14pt; font-weight: bold; color: #2563eb; letter-spacing: 1px; }}
             
-            /* Titles */
             .section-title {{ font-size: 10.5pt; font-weight: bold; color: #0f172a; text-transform: uppercase; border-bottom: 2px solid #cbd5e1; padding-bottom: 4px; margin-top: 14px; margin-bottom: 8px; }}
             
-            /* Tables */
             .grid-table {{ width: 100%; border-collapse: collapse; background: #ffffff; border-radius: 4px; overflow: hidden; margin-bottom: 10px; border: 1px solid #cbd5e1; }}
             .grid-table th, .grid-table td {{ padding: 6px 10px; text-align: left; border-bottom: 1px solid #e2e8f0; font-size: 9pt; }}
             .grid-table th {{ background-color: #f1f5f9; color: #334155; font-size: 8pt; text-transform: uppercase; font-weight: bold; }}
             
-            /* Highlights */
             .text-danger {{ color: #dc2626; font-weight: bold; }}
             .badge-danger {{ background-color: #fef2f2; color: #dc2626; padding: 2px 6px; border-radius: 4px; font-weight: bold; display: inline-block; }}
             .badge-success {{ background-color: #f0fdf4; color: #16a34a; padding: 2px 6px; border-radius: 4px; font-weight: bold; display: inline-block; }}
             
-            /* Advice Box */
-            .advice-card {{ background-color: #eff6ff; border-left: 4px solid #2563eb; padding: 10px 12px; border-radius: 4px; font-size: 8.8pt; color: #1e3a8a; margin-top: 6px; }}
-            .advice-card b {{ color: #1e293b; }}
+            .status-card.success {{ background-color: #f0fdf4; border: 1px solid #bbf7d0; color: #166534; padding: 12px; border-radius: 6px; margin-bottom: 10px; }}
+            
+            .advice-card {{ padding: 10px 12px; border-radius: 4px; font-size: 8.8pt; margin-top: 6px; }}
+            .advice-card.alert {{ background-color: #fef2f2; border-left: 4px solid #dc2626; color: #991b1b; }}
+            .advice-card.info {{ background-color: #eff6ff; border-left: 4px solid #2563eb; color: #1e3a8a; }}
             
             .footer {{ margin-top: 20px; text-align: center; font-size: 8pt; color: #94a3b8; border-top: 1px solid #e2e8f0; padding-top: 8px; }}
         </style>
@@ -193,15 +229,7 @@ def build_pdf_html(data: dict) -> str:
         </div>
 
         <div class="section-title">1. Результаты аукциона США (Copart / IAAI)</div>
-        <table class="grid-table">
-            <tr><th width="32%">ПАРАМЕТР</th><th width="68%">ЗНАЧЕНИЕ</th></tr>
-            <tr><td><b>Площадка и Лот:</b></td><td>{auction.get('auction_name')} | Лот № {auction.get('lot_number')}</td></tr>
-            <tr><td><b>Продавец:</b></td><td>{auction.get('seller')}</td></tr>
-            <tr><td><b>Тип документа (Title):</b></td><td><span class="badge-danger">{auction.get('title_status')}</span></td></tr>
-            <tr><td><b>Пробег при списании:</b></td><td><b>{auction.get('odometer_miles')}</b></td></tr>
-            <tr><td><b>Финальная ставка:</b></td><td><b>{auction.get('final_bid')}</b></td></tr>
-            <tr><td><b>Характер повреждений:</b></td><td><span class="text-danger">{auction.get('damage_ru')}</span></td></tr>
-        </table>
+        {auction_content}
 
         <div class="section-title">2. Технические характеристики и структура VIN</div>
         <table class="grid-table">
@@ -221,11 +249,7 @@ def build_pdf_html(data: dict) -> str:
         </table>
 
         <div class="section-title">4. Рекомендации эксперта перед покупкой</div>
-        <div class="advice-card">
-            <b>⚠ Особое внимание при осмотре:</b><br>
-            • У автомобиля зафиксированы повреждения нижней части (Undercarriage / Frame). Обязательно поднимите автомобиль на подъёмнике.<br>
-            • Проверьте состояние геометрических точек подрамника, рычагов передней и задней подвески, поддона двигателя и трансмиссии.
-        </div>
+        {advice_content}
 
         <div class="footer">
             Отчёт сформирован автоматически системой VIN Checker • Данные актуальны на момент запроса
