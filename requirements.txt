@@ -4,3 +4,4 @@ beautifulsoup4
 weasyprint
 aiogram
 curl_cffi
+httpx
