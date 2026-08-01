@@ -2,4 +2,5 @@ fastapi
 uvicorn
 httpx
 beautifulsoup4
-fpdf2
+weasyprint
+aiogram
